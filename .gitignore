@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch & C++ Builds (算子编译产物)
+build/
+*.so
+*.o
+models/ops/dist/
+models/ops/build/
+*.egg-info/
+
+# Data & Output (不要上传数据和模型权重)
+data/
+output/
+exps/
+*.pth
+*.checkpoint
+
+# IDEs
+.idea/
+.vscode/
+
+# Logs
+*.log
+tensorboard/
