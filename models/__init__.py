@@ -1,2 +1,5 @@
-# __init__.py - Part of thermalTracker
+# models/__init__.py
+from .motr import build
 
+def build_model(args):
+    return build(args)
