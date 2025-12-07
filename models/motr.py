@@ -1,4 +1,7 @@
 # models/motr.py
+# ------------------------------------------------------------------------
+# 核心修复版：强制 Mask=False (有效)，防止均值预测
+# ------------------------------------------------------------------------
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,9 +9,8 @@ from util import box_ops
 from models.backbone import build_backbone
 from models.transformer import build_transformer
 from models.matcher import build_matcher
-import torchvision
 
-# --- Sigmoid Focal Loss (手动实现) ---
+# 手动实现 Sigmoid Focal Loss
 def sigmoid_focal_loss(inputs, targets, alpha: float = 0.25, gamma: float = 2):
     prob = inputs.sigmoid()
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
@@ -27,7 +29,7 @@ class MOTRGBT(nn.Module):
         self.transformer = transformer
         hidden_dim = transformer.d_model
         
-        # 1. 投影层
+        # 1. Projections
         num_backbone_outs = len(backbone.num_channels)
         input_proj_list = []
         for i in range(num_backbone_outs):
@@ -36,7 +38,7 @@ class MOTRGBT(nn.Module):
                 nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
                 nn.GroupNorm(32, hidden_dim),
             ))
-        # 第 4 层
+        # 4th level
         for _ in range(1):
             input_proj_list.append(nn.Sequential(
                 nn.Conv2d(in_channels, hidden_dim, kernel_size=3, stride=2, padding=1),
@@ -67,29 +69,29 @@ class MOTRGBT(nn.Module):
             src_rgb.append(self.input_proj[l](feat_rgb.tensors))
             src_thermal.append(self.input_proj[l](feat_th.tensors))
             
-            # [暴力修复] 强制 Mask 全为 False (表示所有像素都有效)
-            # 原始代码: masks.append(feat_rgb.mask)
-            # 现在的逻辑: 不管 Backbone 输出啥 mask，我都强制设为有效
-            b, c, h, w = feat_rgb.tensors.shape
-            zeros_mask = torch.zeros((b, h, w), dtype=torch.bool, device=feat_rgb.tensors.device)
-            masks.append(zeros_mask)
+            # === [核弹级修复] 强制 Mask 全为 False (有效) ===
+            b, _, h, w = feat_rgb.tensors.shape
+            force_valid_mask = torch.zeros((b, h, w), dtype=torch.bool, device=feat_rgb.tensors.device)
+            masks.append(force_valid_mask)
+            # ============================================
             
             pos_embeds.append(pos[l])
             
-        # 3. 第 4 层下采样
+        # 3. 4th Level
         if len(self.input_proj) > len(features_rgb):
             last_feat_rgb = self.input_proj[-1](features_rgb[-1].tensors)
             last_feat_thermal = self.input_proj[-1](features_thermal[-1].tensors)
             src_rgb.append(last_feat_rgb)
             src_thermal.append(last_feat_thermal)
             
-            # [暴力修复] 第4层 Mask 也强制全为 False
-            b, c, h, w = last_feat_rgb.shape
-            zeros_mask = torch.zeros((b, h, w), dtype=torch.bool, device=last_feat_rgb.device)
-            masks.append(zeros_mask)
+            # === [核弹级修复] 第4层也强制有效 ===
+            b, _, h, w = last_feat_rgb.shape
+            force_valid_mask = torch.zeros((b, h, w), dtype=torch.bool, device=last_feat_rgb.device)
+            masks.append(force_valid_mask)
+            # ==================================
             
             p = pos[-1]
-            pos_l = F.interpolate(p, size=(h, w), mode='bilinear', align_corners=False)
+            pos_l = F.interpolate(p, size=last_feat_rgb.shape[-2:], mode='bilinear', align_corners=False)
             pos_embeds.append(pos_l)
 
         # 4. Transformer
@@ -192,19 +194,10 @@ class MLP(nn.Module):
         return x
 
 def build(args):
-    # GTOT 单类别
     num_classes = 1 
     backbone = build_backbone(args)
     transformer = build_transformer(args)
-    
-    model = MOTRGBT(
-        backbone,
-        transformer,
-        num_classes=num_classes,
-        num_queries=args.num_queries,
-        aux_loss=True,
-    )
-    
+    model = MOTRGBT(backbone, transformer, num_classes=1, num_queries=args.num_queries, aux_loss=True)
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef, 'loss_giou': args.giou_loss_coef}
     if args.aux_loss:
@@ -212,8 +205,6 @@ def build(args):
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
-
     losses = ['labels', 'boxes']
-    criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict, losses=losses)
-    
+    criterion = SetCriterion(1, matcher=matcher, weight_dict=weight_dict, losses=losses)
     return model, criterion

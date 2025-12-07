@@ -22,5 +22,19 @@ python main.py \
 
 python demo.py \
   --seq_name Tricycle \
-  --checkpoint output/overfit_test/checkpoint0049.pth \
+  --checkpoint output/final_hope/checkpoint0049.pth \
   --output_dir output/vis_result
+
+
+python main.py \
+  --data_path ./data/GTOT \
+  --output_dir output/final_sleep_run \
+  --batch_size 2 \
+  --epochs 400 \
+  --lr_drop 200 \
+  --lr 1e-4 \
+  --lr_backbone 1e-5 \
+  --num_queries 10 \
+  --bbox_loss_coef 10 \
+  --giou_loss_coef 5 \
+  --seed 42

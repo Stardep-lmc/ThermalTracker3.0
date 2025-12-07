@@ -19,7 +19,7 @@ def get_args_parser():
     parser.add_argument('--backbone', default='resnet50', type=str)
     parser.add_argument('--dilation', action='store_true')
     parser.add_argument('--hidden_dim', default=256, type=int)
-    parser.add_argument('--num_queries', default=300, type=int)
+    parser.add_argument('--num_queries', default=10, type=int)
     parser.add_argument('--dec_layers', default=6, type=int)
     parser.add_argument('--aux_loss', default=True, type=bool)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
@@ -42,27 +42,39 @@ def get_args_parser():
     return parser
 
 def preprocess(img_rgb, img_t):
-    """
-    预处理函数：必须与训练时的 transforms 逻辑保持高度一致
-    """
-    # 1. 强制尺寸对齐
-    if img_rgb.size != img_t.size:
-        img_t = img_t.resize(img_rgb.size, Image.BILINEAR)
+    # 1. 获取原始尺寸
+    w, h = img_rgb.size
+    
+    # 2. [核心修复] 模拟训练时的 Resize 逻辑 (Min size 800, Max size 1333)
+    # 这是 Deformable DETR / MOTR 的标准 val_transform
+    target_size = 800
+    max_size = 1333
+    
+    scale = float(target_size) / float(min(h, w))
+    
+    # 防止长边超标
+    if max(h, w) * scale > max_size:
+        scale = float(max_size) / float(max(h, w))
+    
+    new_h = int(h * scale)
+    new_w = int(w * scale)
+    
+    # 执行 Resize
+    img_rgb = img_rgb.resize((new_w, new_h), Image.BILINEAR)
+    img_t = img_t.resize((new_w, new_h), Image.BILINEAR)
 
-    # 2. ToTensor (0-255 -> 0.0-1.0)
+    # 3. ToTensor
     img_rgb = TF.to_tensor(img_rgb)
     img_t = TF.to_tensor(img_t)
 
-    # 3. Normalize (ImageNet mean/std)
+    # 4. Normalize (必须有!)
     mean = [0.485, 0.456, 0.406]
     std = [0.229, 0.224, 0.225]
-    
     img_rgb = TF.normalize(img_rgb, mean=mean, std=std)
     
-    # Thermal 处理: 如果是单通道，不做 Normalize 或者简单处理，需与训练 transforms 保持一致
-    # 假设 transforms_rgbt.py 里的 Normalize 会处理单通道
+    # Thermal Normalize (假设是单通道)
     if img_t.shape[0] == 1:
-         img_t = (img_t - 0.5) / 0.5 
+        img_t = (img_t - 0.5) / 0.5
     else:
         img_t = TF.normalize(img_t, mean=mean, std=std)
         

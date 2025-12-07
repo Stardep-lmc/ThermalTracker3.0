@@ -1,69 +1,87 @@
 # util/misc.py
-import torch
-from typing import Optional, List
-from torch import Tensor
+import os
+import subprocess
 import time
-import datetime
 from collections import defaultdict, deque
+import datetime
+import pickle
+from typing import Optional, List
 
-# 引入 NestedTensor 定义，确保兼容性
-from models.backbone import NestedTensor
+import torch
+import torch.distributed as dist
+from torch import Tensor
 
-def _max_by_axis(the_list):
-    # type: (List[List[int]]) -> List[int]
-    maxes = the_list[0]
-    for sublist in the_list[1:]:
-        for index, item in enumerate(sublist):
-            maxes[index] = max(maxes[index], item)
-    return maxes
+# --- Distributed Utils ---
 
-def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
+def setup_for_distributed(is_master):
     """
-    核心函数：将一批不同大小的 Tensor 拼接成一个 NestedTensor (Padding 到最大尺寸)
+    This function disables printing when not in master process
     """
-    if tensor_list[0].ndim == 3:
-        # TODO make it support different-sized images
-        max_size = _max_by_axis([list(img.shape) for img in tensor_list])
-        # batch_shape = [batch_size] + max_size
-        batch_shape = [len(tensor_list)] + max_size
-        b, c, h, w = batch_shape
-        dtype = tensor_list[0].dtype
-        device = tensor_list[0].device
-        
-        # 初始化全 0 的 Tensor (Padding 部分为 0)
-        tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
-        # 初始化全 1 (True) 的 Mask (Padding 部分为 True)
-        mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
-        
-        # [修正] 这里之前写成了 forimg，必须加空格变为 for img
-        for img, pad_img, m in zip(tensor_list, tensor, mask):
-            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
-            m[: img.shape[1], : img.shape[2]] = False # 有图的地方 Mask 为 False
+    import builtins as __builtin__
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
+
+def is_dist_avail_and_initialized():
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True
+
+def get_world_size():
+    if not is_dist_avail_and_initialized():
+        return 1
+    return dist.get_world_size()
+
+def get_rank():
+    if not is_dist_avail_and_initialized():
+        return 0
+    return dist.get_rank()
+
+def is_main_process():
+    return get_rank() == 0
+
+def save_on_master(*args, **kwargs):
+    if is_main_process():
+        torch.save(*args, **kwargs)
+
+def init_distributed_mode(args):
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ["WORLD_SIZE"])
+        args.gpu = int(os.environ["LOCAL_RANK"])
+    elif 'SLURM_PROCID' in os.environ:
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.gpu = args.rank % torch.cuda.device_count()
     else:
-        raise ValueError('not supported')
-    return NestedTensor(tensor, mask)
+        print('Not using distributed mode')
+        args.distributed = False
+        return
 
-def collate_fn(batch):
-    """
-    自定义 DataLoader 的整理函数，处理 RGB 和 Thermal 双模态
-    batch: List of (rgb, thermal, target)
-    """
-    batch = list(zip(*batch))
-    # batch[0] is tuple of RGB tensors
-    # batch[1] is tuple of Thermal tensors
-    # batch[2] is tuple of targets
-    
-    samples_rgb = nested_tensor_from_tensor_list(batch[0])
-    samples_thermal = nested_tensor_from_tensor_list(batch[1])
-    targets = batch[2]
-    
-    return samples_rgb, samples_thermal, targets
+    args.distributed = True
 
-# --- 简单的日志记录器 ---
+    torch.cuda.set_device(args.gpu)
+    args.dist_backend = 'nccl'
+    print('| distributed init (rank {}): {}'.format(
+        args.rank, args.dist_url), flush=True)
+    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                         world_size=args.world_size, rank=args.rank)
+    torch.distributed.barrier()
+    setup_for_distributed(args.rank == 0)
+
+# --- Metric Logger ---
+
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
     window or the global series average.
     """
+
     def __init__(self, window_size=20, fmt=None):
         if fmt is None:
             fmt = "{median:.4f} ({global_avg:.4f})"
@@ -78,17 +96,27 @@ class SmoothedValue(object):
         self.total += value * n
 
     def synchronize_between_processes(self):
-        # 单卡训练不需要同步
-        pass
+        """
+        Warning: does not synchronize the deque!
+        """
+        if not is_dist_avail_and_initialized():
+            return
+        t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
+        dist.barrier()
+        dist.all_reduce(t)
+        t = t.tolist()
+        self.count = int(t[0])
+        self.total = t[1]
 
     @property
     def median(self):
-        d = torch.tensor(list(self.deque))
+        # [Fix] float32 to avoid Long error
+        d = torch.tensor(list(self.deque), dtype=torch.float32)
         return d.median().item()
 
     @property
     def avg(self):
-        d = torch.tensor(list(self.deque))
+        d = torch.tensor(list(self.deque), dtype=torch.float32)
         return d.mean().item()
 
     @property
@@ -162,6 +190,8 @@ class MetricLogger(object):
             'time: {time}',
             'data: {data}'
         ]
+        if torch.cuda.is_available():
+            log_msg.append('max mem: {memory:.0f}')
         log_msg = self.delimiter.join(log_msg)
         MB = 1024.0 * 1024.0
         for obj in iterable:
@@ -171,13 +201,79 @@ class MetricLogger(object):
             if i % print_freq == 0 or i == len(iterable) - 1:
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                print(log_msg.format(
-                    i, len(iterable), eta=eta_string,
-                    meters=str(self),
-                    time=str(iter_time), data=str(data_time)))
+                if torch.cuda.is_available():
+                    print(log_msg.format(
+                        i, len(iterable), eta=eta_string,
+                        meters=str(self),
+                        time=str(iter_time),
+                        data=str(data_time),
+                        memory=torch.cuda.max_memory_allocated() / MB))
+                else:
+                    print(log_msg.format(
+                        i, len(iterable), eta=eta_string,
+                        meters=str(self),
+                        time=str(iter_time),
+                        data=str(data_time)))
             i += 1
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('{} Total time: {} ({:.4f} s / it)'.format(
             header, total_time_str, total_time / len(iterable)))
+
+# --- Tensor Utils ---
+
+class NestedTensor(object):
+    def __init__(self, tensors, mask: Optional[Tensor]):
+        self.tensors = tensors
+        self.mask = mask
+
+    def to(self, device):
+        cast_tensor = self.tensors.to(device)
+        mask = self.mask
+        if mask is not None:
+            assert mask is not None
+            cast_mask = mask.to(device)
+        else:
+            cast_mask = None
+        return NestedTensor(cast_tensor, cast_mask)
+
+    def decompose(self):
+        return self.tensors, self.mask
+
+    def __repr__(self):
+        return str(self.tensors)
+
+def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
+    if tensor_list[0].ndim == 3:
+        if torchvision._is_tracing():
+            # nested_tensor_from_tensor_list() does not export well to ONNX
+            # call _onnx_nested_tensor_from_tensor_list() instead
+            return _onnx_nested_tensor_from_tensor_list(tensor_list)
+
+    max_size = _max_by_axis([list(img.shape) for img in tensor_list])
+    batch_shape = [len(tensor_list)] + max_size
+    b, c, h, w = batch_shape
+    dtype = tensor_list[0].dtype
+    device = tensor_list[0].device
+    tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
+    mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
+    for img, pad_img, m in zip(tensor_list, tensor, mask):
+        pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+        m[: img.shape[1], : img.shape[2]] = False
+    return NestedTensor(tensor, mask)
+
+def _max_by_axis(the_list):
+    maxes = the_list[0]
+    for sublist in the_list[1:]:
+        for index, item in enumerate(sublist):
+            maxes[index] = max(maxes[index], item)
+    return maxes
+
+def collate_fn(batch):
+    batch = list(zip(*batch))
+    batch[0] = nested_tensor_from_tensor_list(batch[0]) # RGB
+    batch[1] = nested_tensor_from_tensor_list(batch[1]) # Thermal
+    return tuple(batch)
+
+import torchvision
