@@ -133,26 +133,26 @@ class RGBTTDecoderLayer(nn.Module):
                 src_rgb, src_thermal, 
                 src_spatial_shapes, level_start_index, src_padding_mask=None):
         
-        # ... (前面的 Self Attention 不动) ...
+        # ... (前面的代码不变) ...
 
         # 2. Cross Attention RGB
         tgt_rgb = self.cross_attn_rgb(tgt + query_pos, reference_points, src_rgb, src_spatial_shapes, level_start_index, src_padding_mask)
         tgt_rgb = self.norm_rgb(tgt + self.dropout_rgb(tgt_rgb))
 
-        # 3. Cross Attention Thermal
+        # 3. Cross Attention Thermal (虽然计算了，但我们不用它)
         tgt_thermal = self.cross_attn_thermal(tgt + query_pos, reference_points, src_thermal, src_spatial_shapes, level_start_index, src_padding_mask)
         tgt_thermal = self.norm_thermal(tgt + self.dropout_thermal(tgt_thermal))
 
-        # === [修改这里！] ===
+        # === [修改这里：强制只用 RGB] ===
         # 原代码：
         # alpha = torch.sigmoid(self.fusion_gate(tgt)) 
         # tgt_fused = alpha * tgt_rgb + (1 - alpha) * tgt_thermal
         
-        # 修改后：强制只看 RGB！
+        # 修改后：
         tgt_fused = tgt_rgb 
-        # ==================
+        # ==============================
 
-        # ... (后面的 FFN 不动) ...
+        # ... (后面的代码不变) ...
         tgt2 = self.linear2(self.dropout2(self.activation(self.linear1(tgt_fused))))
         tgt = self.norm2(tgt_fused + self.dropout3(tgt2))
 
